@@ -199,9 +199,13 @@
             }
 
             function resize() {
-                // Back the canvas with devicePixelRatio so the arcs stay smooth
-                // if this face is ever shown on a panel larger than 320x240.
-                const ratio = window.devicePixelRatio || 1;
+                // Supersample. The panel is 320x240 and the host webview may well
+                // report a device pixel ratio of 1, which rasterises every arc and
+                // curve at exactly panel resolution - visibly stepped on a screen
+                // this small. Backing the canvas at no less than 2x and letting it
+                // downscale on composite costs four times the pixels of a trivial
+                // drawing and buys proper edge antialiasing.
+                const ratio = Math.max(2, window.devicePixelRatio || 1);
                 const width = window.innerWidth;
                 const height = window.innerHeight;
 
@@ -223,7 +227,8 @@
                     radius: minimum * 0.44,
                     scale: minimum / 240,
                     width: width,
-                    height: height
+                    height: height,
+                    ratio: ratio
                 };
             }
 
@@ -455,12 +460,17 @@
             // An AIO screen runs every hour the machine is on, showing largely the
             // same pixels. Drift the whole composition slowly so no element sits
             // on one pixel long enough to burn in.
+            //
+            // Rounded to whole pixels deliberately. A fractional offset moves
+            // every glyph and stroke onto half-pixel boundaries, so the whole
+            // composition gets resampled a slightly different way each frame -
+            // which reads as softness and shimmer, not as protection.
             function burnInOffset() {
                 if (!burnInGuard) return { x: 0, y: 0 };
 
                 const t = Date.now() / 1000;
 
-                return { x: Math.sin(t / 97) * 3, y: Math.cos(t / 131) * 3 };
+                return { x: Math.round(Math.sin(t / 97) * 3), y: Math.round(Math.cos(t / 131) * 3) };
             }
 
             function slotRect(element, offset) {
@@ -481,13 +491,10 @@
                 secondary.display += ((secondary.ok ? secondary.value : 0) - secondary.display) * 0.12;
 
                 const accent = currentAccent();
-                const { cx, cy, radius, width, height, scale } = geometry;
+                const { cx, cy, radius, width, height, scale, ratio } = geometry;
                 const offset = burnInOffset();
 
-                context.setTransform(
-                    (window.devicePixelRatio || 1), 0, 0, (window.devicePixelRatio || 1),
-                    offset.x * (window.devicePixelRatio || 1), offset.y * (window.devicePixelRatio || 1)
-                );
+                context.setTransform(ratio, 0, 0, ratio, offset.x * ratio, offset.y * ratio);
                 readout.style.transform = `translate(${offset.x}px, ${offset.y}px)`;
 
                 context.clearRect(-width, -height, width * 3, height * 3);
