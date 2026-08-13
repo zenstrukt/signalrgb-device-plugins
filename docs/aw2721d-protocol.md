@@ -70,6 +70,18 @@ zone-order setting rather than asserting a mapping it cannot back up.
 
 ## Commands
 
+### `D0 F4` — direct/software mode
+
+SignalRGB must put the monitor into direct mode before streaming colours:
+
+```
+00 92 37 05 00 51 82 D0 F4 99
+```
+
+Without this command, the monitor may accept an individual colour write but
+remain governed by its onboard AlienFX state. The plugin sends direct mode once
+during initialization, waits 50ms, then starts `D0 04` updates.
+
 ### `D0 04` — static colour
 
 ```
@@ -87,7 +99,10 @@ Captured examples, all reproduced byte-for-byte by the plugin:
 00 92 37 0a 00 51 87 d0 04 0f 17 ff 15 64 fa    all zones, green
 ```
 
-The monitor wants roughly 50ms between writes.
+The monitor wants roughly 50ms between writes. SignalRGB's render loop can run
+much faster, so the plugin retains only the newest colour requested for each
+zone and sends at most one HID packet per 50ms interval. Zones requesting the
+same colour are combined into one mask and updated atomically.
 
 ### `D0 01` — onboard effect
 

@@ -12,11 +12,11 @@ export function VendorId() { return 0x187C; }
 export function ProductId() { return 0x1009; }
 export function Publisher() { return "Jake"; }
 export function Type() { return "Hid"; }
-export function DeviceType() { return "monitor"; }
-export function Size() { return [4, 1]; }
+export function DeviceType() { return "other"; }
+export function Size() { return [17, 5]; }
 export function DefaultPosition() { return [0, 0]; }
-export function DefaultScale() { return 4.0; }
-export function ImageUrl() { return "https://assets.signalrgb.com/devices/default/monitor.png"; }
+export function DefaultScale() { return 8.0; }
+export function ImageUrl() { return "https://assets.signalrgb.com/devices/brands/alienware/misc/aw3423dw-monitor.png"; }
 export function ConflictingProcesses() { return ["AlienFXSubAgent.exe", "AWCC.UCSubAgent.exe", "AWCC.SCSubAgent.exe"]; }
 
 export function Validate(endpoint) {
@@ -35,9 +35,10 @@ export function ControllableParameters() {
 	];
 }
 
-const ZONE_NAMES = ["Logo", "Stand", "Downlight", "Power Button"];
+const ZONE_NAMES = ["Back Logo", "Stand", "Downlight", "Power Button"];
 const ZONE_BITS = [0x01, 0x02, 0x04, 0x08];
 const ZONE_COUNT = 4;
+const WRITE_INTERVAL_MS = 50;
 
 const PACKET_BYTES = 65;
 const REPORT_PAD = 0xFF;
@@ -53,14 +54,27 @@ const CHECKSUM_SEED = 0x6E;
 const OPCODE_STATIC_COLOR = 0x04;
 
 export function LedNames() { return ZONE_NAMES; }
-export function LedPositions() { return [[0, 0], [1, 0], [2, 0], [3, 0]]; }
+// Spread the zones over the monitor's physical footprint so horizontal canvas
+// effects reach the left/rear logo, centre stand/downlight and right power LED.
+export function LedPositions() { return [[1, 0], [8, 0], [8, 4], [16, 4]]; }
 
 const lastSent = [];
+const desired = [];
+let nextZone = 0;
+let lastWriteAt = 0;
 
 export function Initialize() {
 	device.setName("Alienware AW2721D Monitor");
 	lastSent.length = 0;
+	desired.length = 0;
+	nextZone = 0;
+
+	// Alienware Gen-2 monitors must be put in Direct Mode before D0/04 colour
+	// packets are treated as a live software stream instead of onboard lighting.
+	setDirectMode();
+	device.pause(WRITE_INTERVAL_MS);
 	setZoneColor(0x0F, [0, 0, 0]);
+	lastWriteAt = Date.now();
 }
 
 export function Render() {
@@ -68,19 +82,32 @@ export function Render() {
 
 	for (let zone = 0; zone < ZONE_COUNT; zone++) {
 		const color = getZoneColor(zone);
-		const previous = lastSent[zone];
-
-		// The monitor needs ~50ms between writes, so four zones refreshed
-		// unconditionally would cap the whole device at 5fps. Only zones whose
-		// colour actually moved are sent, which keeps a typical effect - where
-		// most zones are steady most of the time - far cheaper than that.
-		if (previous && previous[0] === color[0] && previous[1] === color[1] && previous[2] === color[2] && previous[3] === brightness) {
-			continue;
-		}
-
-		setZoneColor(ZONE_BITS[mapZone(zone)], color, brightness);
-		lastSent[zone] = [color[0], color[1], color[2], brightness];
+		desired[zone] = [color[0], color[1], color[2], brightness];
 	}
+
+	// Render can run far faster than this monitor accepts HID commands. Keep the
+	// newest canvas sample for every zone, but transmit at most one packet per
+	// 50 ms. This avoids the old 200 ms blocking Render path and stale backlog.
+	if (Date.now() - lastWriteAt < WRITE_INTERVAL_MS) return;
+
+	const zone = findPendingZone();
+	if (zone < 0) return;
+
+	const target = desired[zone];
+	let mask = 0;
+
+	// One packet can address any combination of zones sharing a colour. Forced
+	// mode therefore updates all four lights atomically instead of in four steps.
+	for (let i = 0; i < ZONE_COUNT; i++) {
+		if (!colorsEqual(desired[i], target) || colorsEqual(lastSent[i], target)) continue;
+
+		mask |= ZONE_BITS[mapZone(i)];
+		lastSent[i] = target.slice();
+	}
+
+	setZoneColor(mask, target, target[3]);
+	lastWriteAt = Date.now();
+	nextZone = (zone + 1) % ZONE_COUNT;
 }
 
 export function Shutdown(SystemSuspending) {
@@ -101,6 +128,37 @@ function getBrightness() {
 	const value = Number.parseInt(awBrightness, 10);
 
 	return Math.max(0, Math.min(100, Number.isFinite(value) ? value : 100));
+}
+
+function findPendingZone() {
+	for (let offset = 0; offset < ZONE_COUNT; offset++) {
+		const zone = (nextZone + offset) % ZONE_COUNT;
+
+		if (!colorsEqual(lastSent[zone], desired[zone])) return zone;
+	}
+
+	return -1;
+}
+
+function colorsEqual(left, right) {
+	return Boolean(left && right && left[0] === right[0] && left[1] === right[1] && left[2] === right[2] && left[3] === right[3]);
+}
+
+function setDirectMode() {
+	const packet = new Array(PACKET_BYTES).fill(REPORT_PAD);
+
+	packet[0] = 0x00;
+	packet[1] = 0x92;
+	packet[2] = 0x37;
+	packet[3] = 0x05;
+	packet[4] = 0x00;
+	packet[5] = 0x51;
+	packet[6] = 0x82;
+	packet[7] = 0xD0;
+	packet[8] = 0xF4;
+	packet[9] = 0x99;
+
+	device.write(packet, PACKET_BYTES);
 }
 
 // Opcode 0xD0 0x04: set a static colour on the zones named by the mask. This is
@@ -126,7 +184,6 @@ function setZoneColor(zoneMask, color, brightness = 100) {
 
 	fillChecksum(packet);
 	device.write(packet, PACKET_BYTES);
-	device.pause(50);
 }
 
 function fillChecksum(packet) {
