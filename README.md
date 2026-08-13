@@ -10,6 +10,7 @@ SignalRGB, done. No forked build, no patched install.
 | --- | --- | --- |
 | ASUS ROG Ryujin II (`0B05:1988`) | 320x240 LCD, live canvas streaming | Working |
 | GALAX RTX 4090 SG 1-Click OC (`10DE:2684` / `10DE:167C`) | Lighting, onboard effects, host-written colour palette | Working |
+| Alienware AW2721D (`187C:1009`) | All four AlienFX zones from the canvas, hardware brightness | Untested on second hardware |
 
 Plus `lcd-faces/`, LCD faces you can use on any SignalRGB device with a screen.
 
@@ -56,6 +57,19 @@ drive those effects from the SignalRGB canvas.
 `Diagnostics -> Dump Register Map` prints the controller's register file to the
 SignalRGB log. Useful if you have a different GALAX card and want to check
 whether the same map applies.
+
+### Alienware AW2721D
+
+Close Alienware Command Center — `AlienFXSubAgent.exe` holds the device, and the
+plugin lists it under `ConflictingProcesses` so SignalRGB will warn you.
+
+The monitor's AlienFX controller is a HID child of its built-in USB hub, so
+SignalRGB only binds it during device enumeration. If it does not appear after
+dropping the plugin in, restart SignalRGB rather than waiting for a hot reload.
+
+Four zones map onto the canvas left to right. Which mask bit drives which
+physical light was not isolated from the capture, so if the zones land in the
+wrong order, flip **Zone Order** in the device settings.
 
 ## LCD faces
 
