@@ -1,0 +1,592 @@
+<html lang="en">
+    <head>
+        <title>Radial Telemetry</title>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+        <!-- Transparent body, so Backdrop Opacity below can dial the active
+             SignalRGB effect in behind the gauge instead of hiding it. -->
+        <meta background="true" />
+
+        <meta description="Sensor gauge for AIO pump caps - radial, split or minimal, with live history and burn-in protection" />
+        <meta publisher="Jake" />
+
+        <meta property="layout" label="Layout" type="combobox" values="Radial,Split,Minimal" default="Radial" />
+        <meta property="primarySensor" label="Primary Sensor" type="sensor" default="CPU Temperature" />
+        <meta property="primaryMax" label="Primary Scale Max" type="number" min="10" max="500" default="100" />
+        <meta property="secondarySensor" label="Secondary Sensor" type="sensor" default="GPU Temperature" />
+        <meta property="secondaryMax" label="Secondary Scale Max" type="number" min="10" max="500" default="100" />
+        <meta property="showSecondary" label="Show Secondary" type="boolean" default="true" />
+        <meta property="accentColor" label="Accent Color" type="color" default="#00e5ff" />
+        <meta property="warnColor" label="Warning Color" type="color" default="#ff3b5c" />
+        <meta property="warnThreshold" label="Warning Threshold" type="number" min="0" max="500" default="80" />
+        <meta property="showTrace" label="Show History Trace" type="boolean" default="true" />
+        <meta property="showPeak" label="Show Peak Marker" type="boolean" default="true" />
+        <meta property="showTicks" label="Show Tick Ring" type="boolean" default="true" />
+        <meta property="backdropOpacity" label="Backdrop Opacity" type="number" min="0" max="100" default="90" />
+        <meta property="burnInGuard" label="Burn-in Protection" type="boolean" default="true" />
+
+        <style>
+            html, body {
+                margin: 0;
+                padding: 0;
+                width: 100vw;
+                height: 100vh;
+                overflow: hidden;
+                background: transparent;
+            }
+
+            /* Arcs, bars and the trace are canvas; the readout is DOM. Text
+               hinting through the DOM stays crisp at 320x240 in a way canvas
+               fillText does not. */
+            #dial {
+                position: absolute;
+                inset: 0;
+            }
+
+            #readout {
+                position: absolute;
+                inset: 0;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                font-family: "Segoe UI", "Inter", system-ui, sans-serif;
+                color: #fff;
+                -webkit-font-smoothing: antialiased;
+                pointer-events: none;
+            }
+
+            .label {
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.2em;
+                text-transform: uppercase;
+                opacity: 0.5;
+            }
+
+            .value-row {
+                display: flex;
+                align-items: baseline;
+                line-height: 0.88;
+            }
+
+            .value {
+                font-weight: 700;
+                letter-spacing: -0.035em;
+                font-variant-numeric: tabular-nums;
+            }
+
+            .unit {
+                font-weight: 600;
+                margin-left: 3px;
+                opacity: 0.65;
+            }
+
+            /* Radial ---------------------------------------------------- */
+            #readout.radial { transform: translateY(-4%); }
+            #readout.radial .value { font-size: 66px; }
+            #readout.radial .unit { font-size: 19px; }
+            #readout.radial #secondary { margin-top: 7px; }
+
+            /* Split ----------------------------------------------------- */
+            #readout.split {
+                flex-direction: column;
+                justify-content: center;
+                gap: 26px;
+            }
+            #readout.split .value { font-size: 52px; }
+            #readout.split .unit { font-size: 16px; }
+            #readout.split .block {
+                display: flex;
+                flex-direction: column;
+                align-items: flex-start;
+                width: 208px;
+            }
+            #readout.split .block .label { margin-bottom: 1px; }
+
+            /* The bars are painted on the canvas but positioned by this element,
+               so text and bar can never collide however the type reflows. */
+            .bar-slot { display: none; }
+            #readout.split .bar-slot {
+                display: block;
+                width: 100%;
+                height: 8px;
+                margin-top: 7px;
+            }
+
+            /* Minimal --------------------------------------------------- */
+            #readout.minimal .value { font-size: 118px; }
+            #readout.minimal .unit { font-size: 28px; }
+            #readout.minimal #secondary { display: none !important; }
+
+            #secondary {
+                font-size: 12px;
+                font-weight: 600;
+                letter-spacing: 0.08em;
+                opacity: 0.72;
+                font-variant-numeric: tabular-nums;
+            }
+
+            #secondary .dot {
+                display: inline-block;
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                margin-right: 6px;
+                vertical-align: middle;
+                background: rgba(255, 255, 255, 0.8);
+            }
+
+            .hidden { display: none !important; }
+        </style>
+    </head>
+
+    <body>
+        <canvas id="dial"></canvas>
+
+        <div id="readout" class="radial">
+            <div class="block" id="primary-block">
+                <div class="label" id="label">--</div>
+                <div class="value-row">
+                    <span class="value" id="value">--</span><span class="unit" id="unit"></span>
+                </div>
+                <div class="bar-slot" id="primary-bar"></div>
+            </div>
+
+            <div class="block" id="secondary-block">
+                <div class="label" id="secondary-label"></div>
+                <div class="value-row">
+                    <span class="value" id="secondary-value"></span><span class="unit" id="secondary-unit"></span>
+                </div>
+                <div class="bar-slot" id="secondary-bar"></div>
+            </div>
+
+            <div id="secondary"><span class="dot"></span><span id="secondary-text"></span></div>
+        </div>
+
+        <script>
+            const canvas = document.getElementById("dial");
+            const context = canvas.getContext("2d");
+            const readout = document.getElementById("readout");
+            const labelEl = document.getElementById("label");
+            const valueEl = document.getElementById("value");
+            const unitEl = document.getElementById("unit");
+            const secondaryEl = document.getElementById("secondary");
+            const secondaryTextEl = document.getElementById("secondary-text");
+            const secondaryBlock = document.getElementById("secondary-block");
+            const secondaryLabelEl = document.getElementById("secondary-label");
+            const secondaryValueEl = document.getElementById("secondary-value");
+            const secondaryUnitEl = document.getElementById("secondary-unit");
+            const primaryBar = document.getElementById("primary-bar");
+            const secondaryBar = document.getElementById("secondary-bar");
+
+            // 270 degrees of sweep with the gap at the bottom, which is where the
+            // pump cap's cable exit sits on most mounts.
+            const ARC_START = Math.PI * 0.75;
+            const ARC_SWEEP = Math.PI * 1.5;
+            const TRACE_SAMPLES = 72;
+
+            const trace = [];
+            let primary = { value: 0, display: 0, units: "", ok: false, peak: 0 };
+            let secondary = { value: 0, display: 0, units: "", ok: false };
+            let geometry = { cx: 0, cy: 0, radius: 0, scale: 1, width: 0, height: 0 };
+
+            function number(candidate, fallback) {
+                const parsed = Number.parseFloat(candidate);
+
+                return Number.isFinite(parsed) ? parsed : fallback;
+            }
+
+            function resize() {
+                // Back the canvas with devicePixelRatio so the arcs stay smooth
+                // if this face is ever shown on a panel larger than 320x240.
+                const ratio = window.devicePixelRatio || 1;
+                const width = window.innerWidth;
+                const height = window.innerHeight;
+
+                canvas.width = width * ratio;
+                canvas.height = height * ratio;
+                canvas.style.width = width + "px";
+                canvas.style.height = height + "px";
+                context.setTransform(ratio, 0, 0, ratio, 0, 0);
+
+                const minimum = Math.min(width, height);
+
+                // The arc is pushed out near the panel edge so the gauge fills the
+                // screen, with the tick ring inboard of it. Hanging the ticks
+                // outside instead would put them past the short edge, and ticks
+                // sheared off mid-stroke read as a mistake, not a bleed.
+                geometry = {
+                    cx: width / 2,
+                    cy: height / 2,
+                    radius: minimum * 0.44,
+                    scale: minimum / 240,
+                    width: width,
+                    height: height
+                };
+            }
+
+            function toRgb(hex) {
+                const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex || "");
+
+                return match
+                    ? [parseInt(match[1], 16), parseInt(match[2], 16), parseInt(match[3], 16)]
+                    : [0, 229, 255];
+            }
+
+            function rgba(rgb, alpha) {
+                return `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
+            }
+
+            // Colour tracks the approach to the threshold rather than snapping at
+            // it, so a CPU drifting toward its limit reads as a gradual shift
+            // instead of a binary alarm.
+            //
+            // It goes through amber on the way. Interpolating a cyan accent
+            // straight to a red warning passes through grey at the midpoint,
+            // which is exactly the range a CPU sits in most of the time - the
+            // gauge desaturated precisely when it should have looked purposeful.
+            const MIDPOINT = [255, 176, 32];
+
+            function currentAccent() {
+                const accent = toRgb(accentColor);
+                const warn = toRgb(warnColor);
+                const threshold = number(warnThreshold, 80);
+                const start = threshold * 0.7;
+                const progress = Math.max(0, Math.min(1, (primary.display - start) / Math.max(1, threshold - start)));
+                const from = progress < 0.5 ? accent : MIDPOINT;
+                const to = progress < 0.5 ? MIDPOINT : warn;
+                const mix = progress < 0.5 ? progress * 2 : (progress - 0.5) * 2;
+
+                return from.map((channel, index) => Math.round(channel + (to[index] - channel) * mix));
+            }
+
+            function drawBackdrop() {
+                const opacity = number(backdropOpacity, 90) / 100;
+
+                if (opacity <= 0) return;
+
+                const { cx, cy, radius, width, height } = geometry;
+                const gradient = context.createRadialGradient(cx, cy * 0.85, radius * 0.1, cx, cy, radius * 1.9);
+
+                gradient.addColorStop(0, `rgba(22, 26, 34, ${opacity})`);
+                gradient.addColorStop(1, `rgba(0, 0, 0, ${opacity})`);
+                context.fillStyle = gradient;
+                context.fillRect(-width, -height, width * 3, height * 3);
+            }
+
+            function drawTicks(accent) {
+                if (!showTicks) return;
+
+                const { cx, cy, radius, scale } = geometry;
+                const count = 41;
+                const fill = primary.display / Math.max(1, number(primaryMax, 100));
+
+                for (let index = 0; index < count; index++) {
+                    const fraction = index / (count - 1);
+                    const angle = ARC_START + ARC_SWEEP * fraction;
+                    const major = index % 5 === 0;
+                    const lit = fraction <= fill;
+                    const outer = radius * 0.88;
+                    const inner = radius * (major ? 0.78 : 0.82);
+
+                    context.beginPath();
+                    context.moveTo(cx + Math.cos(angle) * inner, cy + Math.sin(angle) * inner);
+                    context.lineTo(cx + Math.cos(angle) * outer, cy + Math.sin(angle) * outer);
+                    context.lineWidth = (major ? 2 : 1) * scale;
+                    context.strokeStyle = lit ? rgba(accent, major ? 0.9 : 0.55) : `rgba(255, 255, 255, ${major ? 0.22 : 0.12})`;
+                    context.stroke();
+                }
+            }
+
+            function drawArc(radius, width, fraction, colour, glow) {
+                const { cx, cy, scale } = geometry;
+
+                context.lineCap = "round";
+                context.lineWidth = width * scale;
+
+                context.beginPath();
+                context.arc(cx, cy, radius, ARC_START, ARC_START + ARC_SWEEP);
+                context.strokeStyle = "rgba(255, 255, 255, 0.08)";
+                context.stroke();
+
+                if (fraction <= 0) return;
+
+                context.save();
+                if (glow) {
+                    context.shadowBlur = 14 * scale;
+                    context.shadowColor = rgba(colour, 0.75);
+                }
+                context.beginPath();
+                context.arc(cx, cy, radius, ARC_START, ARC_START + ARC_SWEEP * Math.min(1, fraction));
+                context.strokeStyle = rgba(colour, 1);
+                context.stroke();
+                context.restore();
+            }
+
+            // A thin mark left at the highest value seen. On a gauge you glance at
+            // rather than watch, the peak is usually the number you actually
+            // wanted - it survives the moment the load ends.
+            function drawPeakMarker(accent) {
+                if (!showPeak || primary.peak <= 0) return;
+
+                const { cx, cy, radius, scale } = geometry;
+                const fraction = Math.min(1, primary.peak / Math.max(1, number(primaryMax, 100)));
+                const angle = ARC_START + ARC_SWEEP * fraction;
+
+                context.beginPath();
+                context.moveTo(cx + Math.cos(angle) * (radius - 7 * scale), cy + Math.sin(angle) * (radius - 7 * scale));
+                context.lineTo(cx + Math.cos(angle) * (radius + 7 * scale), cy + Math.sin(angle) * (radius + 7 * scale));
+                context.lineWidth = 2 * scale;
+                context.strokeStyle = rgba(accent, 0.95);
+                context.stroke();
+            }
+
+            function drawTrace(accent, box) {
+                if (!showTrace || trace.length < 2) return;
+
+                const { scale } = geometry;
+                const max = Math.max(1, number(primaryMax, 100));
+                const step = box.width / (TRACE_SAMPLES - 1);
+
+                context.save();
+                context.beginPath();
+                trace.forEach((sample, index) => {
+                    const x = box.left + step * index;
+                    const y = box.bottom - box.height * Math.max(0, Math.min(1, sample / max));
+
+                    if (index === 0) context.moveTo(x, y);
+                    else context.lineTo(x, y);
+                });
+
+                context.lineWidth = 2 * scale;
+                context.strokeStyle = rgba(accent, 0.95);
+                context.lineJoin = "round";
+                context.lineCap = "round";
+                context.stroke();
+
+                // Close down to the baseline for a soft fill under the trace,
+                // which reads as depth at a size where a bare line disappears.
+                const lastX = box.left + step * (trace.length - 1);
+                context.lineTo(lastX, box.bottom);
+                context.lineTo(box.left, box.bottom);
+                context.closePath();
+
+                const fill = context.createLinearGradient(0, box.bottom - box.height, 0, box.bottom);
+                fill.addColorStop(0, rgba(accent, 0.35));
+                fill.addColorStop(1, rgba(accent, 0));
+                context.fillStyle = fill;
+                context.fill();
+                context.restore();
+            }
+
+            function drawBar(x, y, width, height, fraction, colour, glow) {
+                const radius = height / 2;
+
+                context.save();
+                context.lineCap = "round";
+                context.lineWidth = height;
+
+                context.beginPath();
+                context.moveTo(x + radius, y);
+                context.lineTo(x + width - radius, y);
+                context.strokeStyle = "rgba(255, 255, 255, 0.1)";
+                context.stroke();
+
+                if (fraction > 0) {
+                    if (glow) {
+                        context.shadowBlur = 10 * geometry.scale;
+                        context.shadowColor = rgba(colour, 0.7);
+                    }
+                    context.beginPath();
+                    context.moveTo(x + radius, y);
+                    context.lineTo(x + radius + (width - radius * 2) * Math.min(1, fraction), y);
+                    context.strokeStyle = rgba(colour, 1);
+                    context.stroke();
+                }
+                context.restore();
+            }
+
+            // Full sensor names run to "GPU Core Temperature" and similar, which
+            // at this panel size renders as an illegible smear. Drop the words
+            // that carry no information once the number and unit are alongside.
+            const NOISE_WORDS = /\b(temperature|temp|usage|load|core|package|total|value|sensor)\b/gi;
+
+            function shortLabel(name) {
+                const trimmed = String(name || "").replace(NOISE_WORDS, "").replace(/\s+/g, " ").trim();
+
+                return (trimmed || String(name || "")).toUpperCase().slice(0, 12);
+            }
+
+            function readSensor(name, store) {
+                const info = name ? engine.getSensorValue(name) : null;
+
+                if (!info) {
+                    store.ok = false;
+
+                    return;
+                }
+
+                store.ok = true;
+                store.value = info.value;
+                store.units = info.units || "";
+            }
+
+            function sampleSensors() {
+                readSensor(primarySensor, primary);
+                readSensor(secondarySensor, secondary);
+
+                if (primary.ok) {
+                    if (primary.value > primary.peak) primary.peak = primary.value;
+                    trace.push(primary.value);
+                    while (trace.length > TRACE_SAMPLES) trace.shift();
+                }
+            }
+
+            function applyLayout() {
+                readout.className = String(layout || "Radial").toLowerCase();
+
+                const split = layout === "Split";
+                secondaryBlock.classList.toggle("hidden", !split || !showSecondary);
+                secondaryEl.classList.toggle("hidden", split || layout === "Minimal" || !showSecondary);
+            }
+
+            // An AIO screen runs every hour the machine is on, showing largely the
+            // same pixels. Drift the whole composition slowly so no element sits
+            // on one pixel long enough to burn in.
+            function burnInOffset() {
+                if (!burnInGuard) return { x: 0, y: 0 };
+
+                const t = Date.now() / 1000;
+
+                return { x: Math.sin(t / 97) * 3, y: Math.cos(t / 131) * 3 };
+            }
+
+            function slotRect(element, offset) {
+                const rect = element.getBoundingClientRect();
+
+                return {
+                    left: rect.left - offset.x,
+                    width: rect.width,
+                    middle: rect.top - offset.y + rect.height / 2
+                };
+            }
+
+            function render() {
+                // Ease toward the reading rather than jumping to it. Sensors
+                // update on a slow poll, so without this the arc steps visibly
+                // once a second instead of sweeping.
+                primary.display += ((primary.ok ? primary.value : 0) - primary.display) * 0.12;
+                secondary.display += ((secondary.ok ? secondary.value : 0) - secondary.display) * 0.12;
+
+                const accent = currentAccent();
+                const { cx, cy, radius, width, height, scale } = geometry;
+                const offset = burnInOffset();
+
+                context.setTransform(
+                    (window.devicePixelRatio || 1), 0, 0, (window.devicePixelRatio || 1),
+                    offset.x * (window.devicePixelRatio || 1), offset.y * (window.devicePixelRatio || 1)
+                );
+                readout.style.transform = `translate(${offset.x}px, ${offset.y}px)`;
+
+                context.clearRect(-width, -height, width * 3, height * 3);
+                drawBackdrop();
+
+                const primaryFraction = primary.display / Math.max(1, number(primaryMax, 100));
+                const secondaryFraction = secondary.display / Math.max(1, number(secondaryMax, 100));
+
+                if (layout === "Split") {
+                    // Take the bar geometry from the laid-out placeholders rather
+                    // than from guessed fractions of the panel. Guessing put the
+                    // bar straight through the value text as soon as the type
+                    // wrapped differently to what the numbers assumed.
+                    // The measured rect already includes the burn-in translate,
+                    // and the canvas transform applies it too, so back it out
+                    // here or the bars drift at twice the rate of the text.
+                    const primaryRect = slotRect(primaryBar, offset);
+
+                    drawBar(primaryRect.left, primaryRect.middle, primaryRect.width, 7 * scale, primaryFraction, accent, true);
+
+                    if (showSecondary) {
+                        const secondaryRect = slotRect(secondaryBar, offset);
+
+                        drawBar(secondaryRect.left, secondaryRect.middle, secondaryRect.width, 5 * scale, secondaryFraction, [255, 255, 255], false);
+                    }
+
+                    drawTrace(accent, {
+                        left: primaryRect.left,
+                        width: primaryRect.width,
+                        bottom: height - 10 * scale,
+                        height: 16 * scale
+                    });
+                } else if (layout === "Minimal") {
+                    const barWidth = width * 0.72;
+
+                    drawBar(cx - barWidth / 2, height - 26 * scale, barWidth, 6 * scale, primaryFraction, accent, true);
+                    drawTrace(accent, { left: cx - barWidth / 2, width: barWidth, bottom: height - 40 * scale, height: 26 * scale });
+                } else {
+                    drawTicks(accent);
+                    drawArc(radius, 9, primaryFraction, accent, true);
+                    drawPeakMarker(accent);
+
+                    if (showSecondary) {
+                        drawArc(radius * 0.70, 4, secondaryFraction, [255, 255, 255], false);
+                    }
+
+                    drawTrace(accent, {
+                        left: cx - radius * 0.41,
+                        width: radius * 0.82,
+                        bottom: cy + radius * 0.60,
+                        height: radius * 0.22
+                    });
+                }
+
+                valueEl.textContent = primary.ok ? Math.round(primary.display) : "--";
+                unitEl.textContent = primary.ok ? primary.units : "";
+                valueEl.style.color = rgba(accent, 1);
+                valueEl.style.textShadow = `0 0 18px ${rgba(accent, 0.45)}`;
+
+                if (showSecondary && secondary.ok) {
+                    const short = shortLabel(secondarySensor);
+                    const rounded = Math.round(secondary.display);
+
+                    secondaryTextEl.textContent = `${short} ${rounded}${secondary.units}`;
+                    secondaryLabelEl.textContent = short;
+                    secondaryValueEl.textContent = rounded;
+                    secondaryUnitEl.textContent = secondary.units;
+                }
+
+                requestAnimationFrame(render);
+            }
+
+            function onlayoutChanged() { applyLayout(); }
+            function onshowSecondaryChanged() { applyLayout(); }
+
+            function onprimarySensorChanged() {
+                labelEl.textContent = shortLabel(primarySensor) || "--";
+                trace.length = 0;
+                primary.peak = 0;
+                sampleSensors();
+            }
+
+            function onsecondarySensorChanged() {
+                sampleSensors();
+            }
+
+            function onReady() {
+                resize();
+                window.addEventListener("resize", resize);
+
+                applyLayout();
+                onprimarySensorChanged();
+                sampleSensors();
+
+                // Sensor values move far slower than the display refresh, so poll
+                // on its own timer and let the render loop interpolate between.
+                setInterval(sampleSensors, 1000);
+                requestAnimationFrame(render);
+            }
+        </script>
+    </body>
+</html>
