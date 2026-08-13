@@ -58,11 +58,13 @@ const CHUNK_BYTES = 4096;
 
 let streamReady = false;
 let lastFrameAt = 0;
-let errorLogged = false;
 
 // Reused across frames so a 230400-element allocation does not land inside the
-// window where the controller is waiting on data.
+// window where the controller is waiting on data. It doubles as the last known
+// good frame, which is what gets re-sent when the canvas has nothing ready.
 const bgrFrame = new Array(FRAME_BYTES);
+let hasGoodFrame = false;
+let repeatedFrames = 0;
 
 export function Initialize() {
 	device.setName("ASUS ROG Ryujin II LCD");
@@ -92,29 +94,34 @@ export function Render() {
 	lastFrameAt = now;
 
 	const rgb = LCD.getFrame({ format: "RGB" });
-	if (!rgb || rgb.length !== FRAME_BYTES) {
-		if (!errorLogged) {
-			device.log(`[Ryujin II LCD] Invalid frame size ${rgb ? rgb.length : 0}; expected ${FRAME_BYTES}`);
-			errorLogged = true;
-		}
-		return;
-	}
+	const frameReady = rgb && rgb.length === FRAME_BYTES;
 
-	errorLogged = false;
-
-	// The controller has already been told to expect 230400 bytes and is sitting
-	// armed until it has them all. Anything slow between here and the last chunk
-	// widens that window, and when it grows too far the controller gives up on
-	// the stream and falls back to its stored animation slot - which is the
-	// factory loop cutting in and then flicking back once the next frame lands.
+	// A media loop reaching its end, or a face still starting up, leaves the
+	// canvas with no frame to hand over for a moment. Returning here - which is
+	// what this did - sends the controller nothing while it is already armed and
+	// waiting for 230400 bytes, so it starves, gives up, and shows its stored
+	// animation until the next good frame arrives. That is the pause at the end
+	// of a loop followed by the factory animation and the flick back.
 	//
-	// The channel swap therefore runs once over the whole frame with a stride of
-	// three, rather than per chunk with a modulo and a three-way branch on every
-	// one of 230400 bytes. Same output, a fraction of the time inside the window.
-	for (let i = 0; i < FRAME_BYTES; i += 3) {
-		bgrFrame[i] = rgb[i + 2];
-		bgrFrame[i + 1] = rgb[i + 1];
-		bgrFrame[i + 2] = rgb[i];
+	// Repeating the last good frame keeps the stream fed across the gap. The
+	// picture holds still for a beat instead of cutting away to something else.
+	if (!frameReady) {
+		if (!hasGoodFrame) return;
+
+		repeatedFrames++;
+	} else {
+		// The controller is armed from the moment it is told a frame is coming,
+		// so anything slow before the last chunk widens the starvation window.
+		// The channel swap therefore runs once over the whole frame with a
+		// stride of three, rather than per chunk with a modulo and a three-way
+		// branch on every one of 230400 bytes. Same output, far less time spent.
+		for (let i = 0; i < FRAME_BYTES; i += 3) {
+			bgrFrame[i] = rgb[i + 2];
+			bgrFrame[i + 1] = rgb[i + 1];
+			bgrFrame[i + 2] = rgb[i];
+		}
+
+		hasGoodFrame = true;
 	}
 
 	const startedAt = Date.now();
@@ -149,7 +156,7 @@ function trackFrameTiming(startedAt, scheduledAt) {
 	if (elapsed > budget) slowFrames++;
 
 	if (frameCount % 300 === 0) {
-		device.log(`[Ryujin II LCD] ${frameCount} frames, ${slowFrames} over budget (${Math.round(budget)}ms), worst ${worstFrameMs}ms`, { toFile: true });
+		device.log(`[Ryujin II LCD] ${frameCount} frames, ${slowFrames} over budget (${Math.round(budget)}ms), worst ${worstFrameMs}ms, ${repeatedFrames} repeated`, { toFile: true });
 		worstFrameMs = 0;
 	}
 }
